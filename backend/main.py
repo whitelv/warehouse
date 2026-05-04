@@ -382,3 +382,32 @@ async def health():
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(keep_alive())
+
+@app.post("/rfid/scan/")
+async def rfid_scan(data: dict):
+    rfid = data.get("rfid", "").upper()
+    if not rfid:
+        raise HTTPException(status_code=400, detail="No RFID")
+    # Register mode
+    if register_mode["active"]:
+        last_scanned_rfid["rfid"] = rfid
+        return {"mode": "register", "rfid": rfid}
+    # Login mode
+    if not login_mode["active"]:
+        return {"mode": "idle"}
+    # Check admin
+    if rfid == ADMIN_RFID:
+        current_session["rfid"] = ADMIN_RFID
+        current_session["name"] = ADMIN_WORKER["name"]
+        current_session["role"] = "admin"
+        login_mode["active"] = False
+        return {"mode": "login", "rfid": ADMIN_RFID, "name": ADMIN_WORKER["name"], "role": "admin"}
+    # Check worker
+    doc = await workers_col.find_one({"rfid": rfid})
+    if not doc:
+        return {"mode": "denied", "rfid": rfid}
+    current_session["rfid"] = doc["rfid"]
+    current_session["name"] = doc["name"]
+    current_session["role"] = doc.get("role", "storekeeper")
+    login_mode["active"] = False
+    return {"mode": "login", "rfid": doc["rfid"], "name": doc["name"], "role": doc.get("role", "storekeeper")}
