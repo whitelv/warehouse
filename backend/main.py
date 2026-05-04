@@ -361,3 +361,24 @@ async def get_stats():
 async def debug_mongo():
     from database import MONGO_URL
     return {"mongo_url": MONGO_URL[:30] + "..."}
+
+import asyncio
+import httpx
+
+async def keep_alive():
+    await asyncio.sleep(60)
+    while True:
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.get("https://warehouse-x4uc.onrender.com/health")
+        except:
+            pass
+        await asyncio.sleep(840)
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(keep_alive())
