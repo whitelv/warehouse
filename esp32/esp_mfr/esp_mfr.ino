@@ -1,10 +1,13 @@
 #include <SPI.h>
+#include "config_local.h"
 #include <Wire.h>
 #include <MFRC522.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include "esp_task_wdt.h"
 #include <HX711_ADC.h>
 
 #define RST_PIN     16
@@ -20,9 +23,10 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 HX711_ADC LoadCell(HX711_DT, HX711_SCK);
 
-const char* ssid      = "My WiFi";
-const char* password  = "84868725";
-const char* serverURL = "https://warehouse-app-t4op.onrender.com";
+const char* ssid      = WIFI_SSID;
+const char* password  = WIFI_PASSWORD;
+const char* serverURL = SERVER_URL;
+WiFiClientSecure secureClient;
 
 bool isAuthorized = false;
 String workerRFID = "";
@@ -214,7 +218,7 @@ void showWeighOLED() {
 // ════════════════════════════════════════════════════════
 bool fetchProduct(String barcode) {
   HTTPClient http;
-  http.begin(String(serverURL) + "/products/barcode/" + barcode);
+  http.begin(secureClient, String(serverURL) + "/products/barcode/" + barcode);
   http.setTimeout(2000);
   int code = http.GET();
   if (code == 200) {
@@ -235,7 +239,7 @@ bool fetchProduct(String barcode) {
 
 bool saveOperation(int quantity, float grossWeight) {
   HTTPClient http;
-  http.begin(String(serverURL) + "/operations/");
+  http.begin(secureClient, String(serverURL) + "/operations/");
   http.addHeader("Content-Type", "application/json");
   String body = "{\"barcode\":\"" + currentBarcode + "\",";
   body += "\"quantity\":" + String(quantity) + ",";
@@ -249,11 +253,13 @@ bool saveOperation(int quantity, float grossWeight) {
 }
 
 void connectWiFi() {
+  secureClient.setInsecure();
   showOLED("Connecting WiFi...");
   WiFi.begin(ssid, password);
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
     delay(500); attempts++;
+    Serial.print("WiFi status: "); Serial.println(WiFi.status());
   }
   if (WiFi.status() == WL_CONNECTED) {
     showOLED("WiFi OK", WiFi.localIP().toString());
@@ -277,6 +283,7 @@ void resetToLogin() {
 
 // ════════════════════════════════════════════════════════
 void setup() {
+  esp_task_wdt_init(60, false);
   Serial.begin(115200);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), onButtonPress, FALLING);
@@ -285,6 +292,7 @@ void setup() {
   delay(500);
   SPI.begin();
   mfrc522.PCD_Init();
+  mfrc522.PCD_DumpVersionToSerial();
   LoadCell.begin();
   LoadCell.start(2000, true);
   LoadCell.setCalFactor(calibrationValue);
@@ -312,7 +320,7 @@ void loop() {
     if (millis() - lastWaitSessionCheck > 5000) {
       lastWaitSessionCheck = millis();
       HTTPClient httpSess;
-      httpSess.begin(String(serverURL) + "/session/");
+      httpSess.begin(secureClient, String(serverURL) + "/session/");
       httpSess.setTimeout(2000);
       int sc = httpSess.GET();
       if (sc == 200) {
@@ -335,7 +343,9 @@ void loop() {
       httpSess.end();
     }
 
-    if (!mfrc522.PICC_IsNewCardPresent()) return;
+    Serial.println("Checking card...");
+  if (!mfrc522.PICC_IsNewCardPresent()) return;
+  Serial.println("Card present!");
     if (!mfrc522.PICC_ReadCardSerial()) return;
 
     String scannedRFID = "";
@@ -344,24 +354,27 @@ void loop() {
       scannedRFID += String(mfrc522.uid.uidByte[i], HEX);
     }
     scannedRFID.toUpperCase();
+    Serial.println("Scanned: " + scannedRFID);
 
-    // Перевіряємо режим реєстрації
-    HTTPClient httpRegMode;
-    httpRegMode.begin(String(serverURL) + "/rfid/register-mode/");
-    httpRegMode.setTimeout(800);
-    int regCode = httpRegMode.GET();
-    String regResp = httpRegMode.getString();
-    httpRegMode.end();
+    // Single HTTPS call handles register/login/deny
+    esp_task_wdt_reset();
+    Serial.println("Calling scan...");
+    HTTPClient httpScan;
+    httpScan.begin(secureClient, String(serverURL) + "/rfid/scan/");
+    httpScan.addHeader("Content-Type", "application/json");
+    httpScan.setTimeout(15000);
+    int scanCode = httpScan.POST("{\"rfid\":\"" + scannedRFID + "\"}");
+    String scanResp = (scanCode == 200) ? httpScan.getString() : "";
+    httpScan.end();
+    Serial.println("Scan code: " + String(scanCode) + " resp: " + scanResp);
 
-    bool isRegisterMode = (regCode == 200 && regResp.indexOf("\"active\":true") >= 0);
+    if (scanCode != 200) {
+      mfrc522.PICC_HaltA();
+      mfrc522.PCD_StopCrypto1();
+      return;
+    }
 
-    if (isRegisterMode) {
-      HTTPClient httpReg;
-      httpReg.begin(String(serverURL) + "/rfid/scanned/");
-      httpReg.addHeader("Content-Type", "application/json");
-      httpReg.setTimeout(2000);
-      httpReg.POST("{\"rfid\":\"" + scannedRFID + "\"}");
-      httpReg.end();
+    if (scanResp.indexOf("\"mode\":\"register\"") >= 0) {
       lastRegisteredRFID = scannedRFID;
       lastRegistrationTime = millis();
       showOLED("Card saved!", scannedRFID, "Enter name on site");
@@ -372,38 +385,24 @@ void loop() {
       return;
     }
 
-    // Перевіряємо режим логіну — якщо не натиснуто "Увійти", ігноруємо
-    HTTPClient httpLoginMode;
-    httpLoginMode.begin(String(serverURL) + "/rfid/login-mode/");
-    httpLoginMode.setTimeout(800);
-    int loginCode = httpLoginMode.GET();
-    String loginResp = httpLoginMode.getString();
-    httpLoginMode.end();
-
-    bool isLoginMode = (loginCode == 200 && loginResp.indexOf("\"active\":true") >= 0);
-
-    if (!isLoginMode) {
-      // Кнопка "Увійти" не натиснута — ігноруємо картку
+    if (scanResp.indexOf("\"mode\":\"idle\"") >= 0) {
       mfrc522.PICC_HaltA();
       mfrc522.PCD_StopCrypto1();
       return;
     }
 
-    // Пропускаємо login якщо це картка щойно зареєстрованого працівника
-    if (scannedRFID == lastRegisteredRFID &&
-        (millis() - lastRegistrationTime) < REGISTRATION_COOLDOWN) {
+    if (scanResp.indexOf("\"mode\":\"denied\"") >= 0) {
+      showOLED("Access Denied", "Unknown card");
       mfrc522.PICC_HaltA();
       mfrc522.PCD_StopCrypto1();
+      delay(2000);
+      showOLED("Scan RFID", "to login");
       return;
     }
 
-    // Режим логіну активний — перевіряємо працівника в БД
-    HTTPClient httpWorker;
-    httpWorker.begin(String(serverURL) + "/workers/" + scannedRFID + "/");
-    httpWorker.setTimeout(2000);
-    int workerCode = httpWorker.GET();
-    String workerBody = (workerCode == 200) ? httpWorker.getString() : "";
-    httpWorker.end();
+    // mode == login
+    int workerCode = 200;
+    String workerBody = scanResp;
 
     if (workerCode == 200) {
       // Parse name from JSON response
@@ -436,7 +435,7 @@ void loop() {
     if (millis() - lastSessionCheck > 3000) {
       lastSessionCheck = millis();
       HTTPClient http;
-      http.begin(String(serverURL) + "/session/");
+      http.begin(secureClient, String(serverURL) + "/session/");
       http.setTimeout(1000);
       int code = http.GET();
       String body = http.getString();
@@ -450,7 +449,7 @@ void loop() {
     if (millis() - lastOledCheck > 2000) {
       lastOledCheck = millis();
       HTTPClient http;
-      http.begin(String(serverURL) + "/oled/");
+      http.begin(secureClient, String(serverURL) + "/oled/");
       http.setTimeout(800);
       int code = http.GET();
       if (code == 200) {
@@ -469,7 +468,7 @@ void loop() {
      if (millis() - lastWeighSend > 400) {
        lastWeighSend = millis();
        HTTPClient http;
-       http.begin(String(serverURL) + "/weight/current/");
+       http.begin(secureClient, String(serverURL) + "/weight/current/");
        http.addHeader("Content-Type", "application/json");
        http.setTimeout(2000);
       int wCode = http.POST("{\"weight\":" + String(currentWeight, 2) + "}");
@@ -505,7 +504,7 @@ void loop() {
          lastAutoConfTime = millis();
          stableCount = 0;
          HTTPClient httpConf;
-         httpConf.begin(String(serverURL) + "/weight/confirmed/");
+         httpConf.begin(secureClient, String(serverURL) + "/weight/confirmed/");
          httpConf.addHeader("Content-Type", "application/json");
          httpConf.setTimeout(1000);
          httpConf.POST("{\"weight\":" + String(currentWeight, 2) + "}");
@@ -518,7 +517,7 @@ void loop() {
      if (millis() - lastPendingCheck > 700) {
        lastPendingCheck = millis();
        HTTPClient http;
-       http.begin(String(serverURL) + "/weigh/pending/");
+       http.begin(secureClient, String(serverURL) + "/weigh/pending/");
        http.setTimeout(800);
        int code = http.GET();
        if (code == 200) {
@@ -537,7 +536,7 @@ void loop() {
                showOLED(currentProduct.substring(0,16), String(currentWeight, 1) + "g", "Wait stable...");
                // Підтверджуємо
                HTTPClient httpC;
-               httpC.begin(String(serverURL) + "/weigh/confirm/");
+               httpC.begin(secureClient, String(serverURL) + "/weigh/confirm/");
                httpC.addHeader("Content-Type", "application/json");
                httpC.POST("{}");
                httpC.end();
@@ -564,15 +563,16 @@ void loop() {
         scannedRFID += String(mfrc522.uid.uidByte[i], HEX);
       }
       scannedRFID.toUpperCase();
+    Serial.println("Scanned: " + scannedRFID);
       HTTPClient httpMode;
-      httpMode.begin(String(serverURL) + "/rfid/register-mode/");
+      httpMode.begin(secureClient, String(serverURL) + "/rfid/register-mode/");
       httpMode.setTimeout(1000);
       int modeCode = httpMode.GET();
       String modeResp = httpMode.getString();
       httpMode.end();
       if (modeCode == 200 && modeResp.indexOf("\"active\":true") >= 0) {
         HTTPClient httpReg;
-        httpReg.begin(String(serverURL) + "/rfid/scanned/");
+        httpReg.begin(secureClient, String(serverURL) + "/rfid/scanned/");
         httpReg.addHeader("Content-Type", "application/json");
         httpReg.setTimeout(2000);
         httpReg.POST("{\"rfid\":\"" + scannedRFID + "\"}");
@@ -592,7 +592,7 @@ void loop() {
     if (millis() - lastWeighSend > 400) {
       lastWeighSend = millis();
       HTTPClient http;
-      http.begin(String(serverURL) + "/weight/current/");
+      http.begin(secureClient, String(serverURL) + "/weight/current/");
       http.addHeader("Content-Type", "application/json");
       http.setTimeout(2000);
       int wCode = http.POST("{\"weight\":" + String(currentWeight, 2) + "}");
@@ -644,7 +644,7 @@ void loop() {
         int qty = (unitWeight > 0) ? (int)(net / unitWeight) : 0;
         showOLED("Saving...", String(qty) + " pcs", String(net, 1) + "g");
         HTTPClient httpConf;
-        httpConf.begin(String(serverURL) + "/weight/confirmed/");
+        httpConf.begin(secureClient, String(serverURL) + "/weight/confirmed/");
         httpConf.addHeader("Content-Type", "application/json");
         httpConf.setTimeout(1000);
         httpConf.POST("{\"weight\":" + String(net, 2) + "}");

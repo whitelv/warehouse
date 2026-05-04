@@ -1,19 +1,13 @@
+# PlatformIO
+.pio/
+
+# Local ESP32 config with credentials
+esp32/esp_mfr/config_local.h
+
 # Python
 __pycache__/
 *.pyc
-*.pyo
 .env
-venv/
-.venv/
 
-# Certificates
-backend/cert.pem
-backend/key.pem
-
-# IDE
-.vscode/
-.idea/
-
-# OS
+# macOS
 .DS_Store
-Thumbs.db
