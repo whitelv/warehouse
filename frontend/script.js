@@ -1,4 +1,4 @@
-  const API = 'https://warehouse-app-t4op.onrender.com';
+  const API = '';
   let productsCache = {};
   let zxingReader = null;
   let cameraStream = null;
