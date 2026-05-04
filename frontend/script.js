@@ -121,7 +121,7 @@
         refreshProtectedPage();
         sendOLED("Access Granted", toLatин(data.name), "Use website");
         showAlert('alert-area', `✅ Вхід виконано: ${data.name}`, 'success');
-      } else if (elapsed >= 30000) {
+      } else if (elapsed >= 90000) {
         clearInterval(loginPoll);
         loginPoll = null;
         await fetch(API + '/rfid/login-mode/', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({active: false}) });
